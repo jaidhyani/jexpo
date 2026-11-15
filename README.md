@@ -84,6 +84,13 @@ plugin {
 ```
 
 All of these can also be set at runtime with `hyprctl keyword plugin:jexpo:<name> <value>`.
+If you load the plugin from an `exec-once` (as with `./build` above), a `plugin { jexpo { } }`
+block in hyprland.conf is parsed before the plugin exists and reports unknown options, so set
+options after the load instead:
+
+```ini
+exec-once = ~/src/jexpo/build && hyprctl plugin load ~/src/jexpo/jexpo.so && hyprctl keyword plugin:jexpo:font "FiraCode Nerd Font"
+```
 
 ## How it works
 
