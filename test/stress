@@ -1,0 +1,91 @@
+#!/bin/bash
+# jexpo's end-to-end test: a nested Hyprland (a small pinned window, bottom right of the live
+# session, never focused) running nested.conf under gdb, driven by ../vpointer.py like a hand
+# would: open/close at every point of the zoom, window and workspace drags (active, empty,
+# fullscreen, right-button), clicks, the special workspace, closing mid-drag, the renumber
+# dispatcher, unloading while open and after use. Stops at the first fault with gdb's backtrace
+# (Ubuntu's debug symbols come from debuginfod). About three minutes.
+#
+#   test/stress            tests ../jexpo.so (build it first), or $JEXPO_SO
+#
+# Needs gdb, grim, python3 and ghostty (the test windows); waybar and hyprpaper, if installed,
+# make the nested session look like a real one. It adds runtime window rules for the nested
+# window (class aquamarine) to your live session; a `hyprctl reload` drops them.
+#
+# Never lets the nested instance touch the live session's environment: shim/ shadows the
+# systemctl and dbus-update-activation-environment it runs at start: a nested Hyprland that opened
+# a seat session exports its WAYLAND_DISPLAY etc. into the user's systemd and dbus environment,
+# and HYPRLAND_NO_SD_VARS doesn't cover the exec-once copy of that (0.53).
+set -u
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+WORK=${JEXPO_TEST_WORK:-$XDG_RUNTIME_DIR/jexpo-test}
+mkdir -p "$WORK"
+SO=$(readlink -f "${JEXPO_SO:-$HERE/../jexpo.so}")
+[ -f "$SO" ] || { echo "no $SO: build it first"; exit 1; }
+sed "s|@JEXPO_SO@|$SO|" "$HERE/nested.conf" > "$WORK/nested.conf"
+
+# the nested window's rules in the live session (runtime keywords: a live `hyprctl reload` drops them)
+hyprctl --batch "keyword windowrule float on, match:class ^(aquamarine)$ ; keyword windowrule pin on, match:class ^(aquamarine)$ ; keyword windowrule size 1280 720, match:class ^(aquamarine)$ ; keyword windowrule move 1266 706, match:class ^(aquamarine)$ ; keyword windowrule no_initial_focus on, match:class ^(aquamarine)$ ; keyword windowrule no_focus on, match:class ^(aquamarine)$" >/dev/null
+
+(cd "$WORK" && env -u HYPRLAND_INSTANCE_SIGNATURE HYPRLAND_NO_SD_VARS=1 PATH="$HERE/shim:$PATH" DEBUGINFOD_URLS=https://debuginfod.ubuntu.com \
+  gdb -q -batch -iex "set debuginfod enabled on" -ex "set pagination off" -ex "handle SIGSEGV stop print" -ex "handle SIGPIPE nostop noprint" \
+  -ex run -ex "bt 25" --args Hyprland -c "$WORK/nested.conf" > "$WORK/gdb.log" 2>&1) &
+GDB=$!
+for _ in $(seq 1 60); do
+  L=$(hyprctl instances -j 2>/dev/null | python3 -c "import json,sys;print(next((i['instance']+' '+i['wl_socket'] for i in json.load(sys.stdin) if i['wl_socket']!='$WAYLAND_DISPLAY'),''))")
+  [ -n "$L" ] && break; sleep 1
+done
+read -r inst wl <<< "$L"
+[ -z "${inst:-}" ] && { echo "nested Hyprland didn't start; $WORK/gdb.log"; exit 1; }
+sleep 3
+
+V() { WAYLAND_DISPLAY=$wl python3 "$HERE/../vpointer.py" 1280 720 "$@"; }
+G() { python3 "$HERE/geo.py" "$@"; }
+H() { hyprctl -i "$inst" "$@" >/dev/null 2>&1; }
+active() { hyprctl -i "$inst" activeworkspace -j | python3 -c "import json,sys;print(json.load(sys.stdin)['id'])"; }
+ws() { hyprctl -i "$inst" clients -j | python3 -c "import json,sys;print(' '.join(f\"{c['address'][-4:]}@{c['workspace']['id']}\" for c in sorted(json.load(sys.stdin),key=lambda c:c['address'])))"; }
+fault() { if grep -qE "received signal|SIGSEGV|SIGABRT" "$WORK/gdb.log"; then echo "FAULT after: $1"; grep -E "^#" "$WORK/gdb.log" | head -14; kill $GDB 2>/dev/null; exit 1; fi; }
+step() { echo "-- $1"; }
+expect() { [ "$2" = "$3" ] && echo "   ok: $1" || { echo "   WRONG: $1: got $2, wanted $3"; FAILED=1; }; }
+FAILED=0
+rm -f "$XDG_RUNTIME_DIR/jexpo-stats"
+
+for w in 1 4 5 2; do H dispatch workspace "$w"; sleep 0.4; done
+echo "start: $(ws)"
+addr_on() { hyprctl -i "$inst" clients -j | python3 -c "import json,sys;print(next((c['address'] for c in json.load(sys.stdin) if c['workspace']['id']==$1 and not c['pinned']),''))"; }
+ws_of() { hyprctl -i "$inst" clients -j | python3 -c "import json,sys;print(next((c['workspace']['id'] for c in json.load(sys.stdin) if c['address']=='$1'),''))"; }
+
+step "open/close, closing at every point of the opening zoom"
+for d in 0.05 0.15 0.3 0.6 1.0; do H dispatch jexpo:expo toggle; sleep $d; H dispatch jexpo:expo toggle; sleep 0.7; done; fault "open/close"
+step "toggle three times fast"; H dispatch jexpo:expo toggle; H dispatch jexpo:expo toggle; H dispatch jexpo:expo toggle; sleep 1; H dispatch jexpo:expo close; sleep 0.8; fault "fast toggles"
+
+H dispatch jexpo:expo toggle; sleep 0.8
+W4=$(addr_on 4)
+step "drag workspace 4's window onto empty 8"; V drag $(G center 4) $(G center 8) 25; sleep 0.6; fault "window drag"; expect "window on 8" "$(ws_of $W4)" 8
+step "drop it back on its own workspace"; V drag $(G center 8) $(G corner 8) 10; sleep 0.4; fault "self drop"; expect "still on 8" "$(ws_of $W4)" 8
+step "drop it outside the grid"; V drag $(G center 8) 1270 710 20; sleep 0.4; fault "outside drop"; expect "still on 8" "$(ws_of $W4)" 8
+W5=$(addr_on 5); W1=$(addr_on 1)
+step "drag workspace 5 by its number to slot 1"; V drag $(G badge 5) $(G center 1) 25; sleep 0.6; fault "workspace drag"
+expect "old 5 is 1" "$(ws_of $W5)" 1; expect "old 1 is 2" "$(ws_of $W1)" 2
+A=$(active); WA=$(addr_on $A)
+step "drag the active workspace ($A) to slot 9"; V drag $(G badge $A) $(G center 9) 25; sleep 0.6; fault "active workspace drag"
+expect "its window on 9" "$(ws_of $WA)" 9; expect "you followed it" "$(active)" 9
+step "drag empty workspace 6 by its background to slot 3"; V drag $(G center 6) $(G center 3) 25; sleep 0.6; fault "empty workspace drag"
+step "right-drag workspace 3 to slot 4"; V right drag $(G center 3) $(G center 4) 25; sleep 0.6; fault "right drag"
+FS=$(hyprctl -i "$inst" clients -j | python3 -c "import json,sys;print(next((c['workspace']['id'] for c in json.load(sys.stdin) if c['fullscreen']),''))")
+step "drag the fullscreen workspace ($FS) to slot 5"; [ -n "$FS" ] && [ "$FS" -le 9 ] && V drag $(G badge $FS) $(G center 5) 25; sleep 0.6; fault "fullscreen workspace drag"
+WAYLAND_DISPLAY=$wl grim "$WORK/open.png"
+step "the special workspace shown, then the expo"; H dispatch jexpo:expo close; sleep 0.8; H dispatch togglespecialworkspace dropdown; sleep 0.5; H dispatch jexpo:expo toggle; sleep 0.8; WAYLAND_DISPLAY=$wl grim "$WORK/special.png"; H dispatch jexpo:expo close; sleep 0.8; H dispatch togglespecialworkspace dropdown; sleep 0.5; fault "special"
+step "a workspace switch while open"; H dispatch jexpo:expo toggle; sleep 0.8; H dispatch workspace 3; sleep 1; fault "switch while open"; expect "on 3" "$(active)" 3
+step "click workspace 7's background"; H dispatch jexpo:expo toggle; sleep 0.8; V click $(G corner 7); sleep 1; fault "click"; expect "went to 7" "$(active)" 7
+step "click a window"; H dispatch jexpo:expo toggle; sleep 0.8; V click $(G center 9); sleep 1; fault "window click"; expect "went to 9" "$(active)" 9
+step "click off the grid"; H dispatch jexpo:expo toggle; sleep 0.8; V click 5 5; sleep 1; fault "click off"; expect "stayed on 9" "$(active)" 9
+step "close mid-drag"; H dispatch jexpo:expo toggle; sleep 0.8; read -r x y <<< "$(G center 9)"
+V move $x $y press move $((x+40)) $((y+40)) move $((x+80)) $((y+60)) sleep 0.6 & VP=$!; sleep 0.3; H dispatch jexpo:expo close; wait $VP; V release; sleep 1; fault "close mid-drag"
+W2=$(addr_on 2)
+step "jexpo:renumber 2 6"; H dispatch jexpo:renumber 2 6; sleep 0.3; fault "renumber"; [ -n "$W2" ] && expect "old 2 is 6" "$(ws_of $W2)" 6
+step "unload while open"; H dispatch jexpo:expo toggle; sleep 0.6; H plugin unload "$SO"; sleep 1; fault "unload while open"
+step "load, open, close, unload"; H plugin load "$SO"; H dispatch jexpo:expo toggle; sleep 0.8; H dispatch jexpo:expo close; sleep 1; H plugin unload "$SO"; sleep 1; fault "unload after use"
+echo "frame timings (one line per close):"; cat "$XDG_RUNTIME_DIR/jexpo-stats"
+H dispatch exit; sleep 2; kill $GDB 2>/dev/null
+[ $FAILED = 0 ] && echo "PASSED: no faults, every check right (screens in $WORK)" || { echo "NO FAULTS, BUT SOME CHECKS WRONG"; exit 1; }

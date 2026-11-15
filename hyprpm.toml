@@ -1,0 +1,10 @@
+[repository]
+name = "jexpo"
+authors = ["jaidhyani"]
+commit_pins = []
+
+[jexpo]
+description = "Workspaces 1-9 as a live grid: drag windows between workspaces, drag workspaces to renumber them"
+authors = ["jaidhyani"]
+output = "jexpo.so"
+build = ["make all"]

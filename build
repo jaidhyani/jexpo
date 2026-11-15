@@ -1,0 +1,46 @@
+#!/bin/bash
+# Build jexpo against the installed Hyprland, without root: the headers come from the archive's
+# hyprland-dev of exactly the installed version (and the -dev packages it needs), downloaded with
+# apt-get download and unpacked into a cache, never installed. A plugin needs only headers:
+# Hyprland's own binary supplies every symbol when it loads the .so.
+#
+#   ./build          build ./jexpo.so if it's missing or older than the sources or the
+#                    installed Hyprland (cheap enough to run from an exec-once at every login)
+#   ./build --force  build regardless
+#
+# Debian/Ubuntu only (it needs apt and dpkg). Elsewhere, install your distro's Hyprland headers
+# and run make, or use hyprpm.
+#
+# Hyprland refuses (with a notification, no crash) a plugin built for another version, so after
+# an apt upgrade of hyprland the next login rebuilds before the plugin loads.
+set -euo pipefail
+HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
+OUT=$HERE/jexpo.so
+VERSION=$(dpkg-query -W -f='${Version}' hyprland)
+CACHE=~/.cache/jexpo/$VERSION
+SYSROOT=$CACHE/sysroot
+
+newest_input=$(stat -c %Y "$HERE"/*.cpp "$HERE"/*.hpp /usr/bin/Hyprland | sort -n | tail -1)
+if [[ "${1:-}" != --force && -f $OUT && $(stat -c %Y "$OUT") -ge $newest_input ]]; then
+    exit 0
+fi
+
+if [[ ! -f $SYSROOT/.done ]]; then
+    mkdir -p "$CACHE/debs" "$SYSROOT"
+    cd "$CACHE/debs"
+    roots=(hyprland-dev libgles-dev libgl-dev libudev-dev libpixman-1-dev libcairo2-dev)
+    apt-cache depends --recurse --no-recommends --no-suggests --no-conflicts --no-breaks --no-replaces \
+        --no-enhances "${roots[@]}" 2>/dev/null | grep -v '^ ' | grep -E -- '-dev$' | sort -u >list
+    apt-get download -q "hyprland-dev=$VERSION" $(grep -vx hyprland-dev list) >/dev/null
+    for deb in *.deb; do dpkg -x "$deb" "$SYSROOT"; done
+    touch "$SYSROOT/.done"
+fi
+
+export PKG_CONFIG_SYSROOT_DIR=$SYSROOT
+export PKG_CONFIG_LIBDIR=$SYSROOT/usr/lib/x86_64-linux-gnu/pkgconfig:$SYSROOT/usr/share/pkgconfig:$SYSROOT/usr/lib/pkgconfig
+mkdir -p "$(dirname "$OUT")"
+g++ -shared -fPIC --no-gnu-unique -O2 -g -std=c++2b -Wno-narrowing \
+    -I"$SYSROOT/usr/include" $(pkg-config --cflags pixman-1 libdrm hyprland cairo libinput libudev wayland-server xkbcommon) \
+    "$HERE"/main.cpp "$HERE"/expo.cpp "$HERE"/renumber.cpp -o "$OUT.new"
+mv "$OUT.new" "$OUT"
+echo "built $OUT for Hyprland $VERSION"
