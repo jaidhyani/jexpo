@@ -1,7 +1,9 @@
 [repository]
 name = "jexpo"
 authors = ["jaidhyani"]
-commit_pins = []
+commit_pins = [
+    ["dd220efe7b1e292415bd0ea7161f63df9c95bfd3", "28e917ad013a004df94681aa4ff57172d8c36fa1"], # 0.53.3
+]
 
 [jexpo]
 description = "Workspaces 1-9 as a live grid: drag windows between workspaces, drag workspaces to renumber them"
